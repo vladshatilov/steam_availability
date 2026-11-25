@@ -20,6 +20,7 @@ param(
     [string]$Mode = 'Menu',
     [string]$OutDir = (Join-Path $PSScriptRoot 'data'),
     [int]$IntervalSec = 15,
+    [int]$CfBigEvery = -1,            # качать 256 КБ с Cloudflare раз в N циклов; -1 = из $Cfg
     [int]$DurationMin = 0,
     [int]$Hours = 0,                  # для Report: за сколько последних часов (0 = 7 дней или -Since)
     [datetime]$Since = (Get-Date).AddDays(-7),
@@ -42,6 +43,8 @@ $Cfg = @{
     CfHttp          = @('https://www.cloudflare.com/cdn-cgi/trace', 'https://1.1.1.1/cdn-cgi/trace')
     CfBig           = 'https://speed.cloudflare.com/__down?bytes=262144'   # 256 КБ; ТСПУ режет CF после ~16 КБ
     CfBigTimeoutMs  = 6000
+    CfBigEvery      = 10        # качать 256 КБ раз в N циклов (1 = каждый цикл). При 15 с: 1 -> ~1.5 ГБ/сутки, 10 -> ~150 МБ/сутки.
+                                # Пока Cloudflare в состоянии CF_* (сбой), качается каждый цикл, чтобы точно поймать конец сбоя
     SteamHttp       = @(
         'https://store.steampowered.com/',
         'https://api.steampowered.com/ISteamWebAPIUtil/GetServerInfo/v1/',
@@ -51,13 +54,14 @@ $Cfg = @{
     IspHop          = ''        # IP первого хопа провайдера; пусто = определить автоматически через tracert
     PublicIpEvery   = 20        # проверять внешний IP каждые N циклов (и после каждого восстановления)
     TraceCooldownS  = 300       # не чаще одного tracert на цель за N секунд
-    RetentionDays   = 14        # удалять CSV, трассировки, снапшоты и строки events.log старше N дней (0 = не удалять)
+    RetentionDays   = 10        # удалять CSV, трассировки, снапшоты и строки events.log старше N дней (0 = не удалять)
     KeepSnapshots   = 3         # сколько последних снапшотов хранить всегда, независимо от возраста
 }
 
 $ScriptPath = $PSCommandPath
 $StartupLink = Join-Path ([Environment]::GetFolderPath('Startup')) 'netmon-monitor.lnk'
 $Retention = if ($RetentionDays -ge 0) { $RetentionDays } else { $Cfg.RetentionDays }
+$CfBigStep = [Math]::Max(1, $(if ($CfBigEvery -gt 0) { $CfBigEvery } else { $Cfg.CfBigEvery }))
 
 $VerdictHelp = [ordered]@{
     'OK'                = 'всё работает'
@@ -539,7 +543,7 @@ function Invoke-DnsChecks([string]$Server) {
 }
 
 function Format-Cat($Checks) {
-    $items = @($Checks)
+    $items = @($Checks | Where-Object { $_ })     # @($null) дал бы массив из одного элемента
     if (-not $items.Count) { return '-' }
     $okItems = @($items | Where-Object Ok)
     $text = '{0}/{1}' -f $okItems.Count, $items.Count
@@ -566,7 +570,9 @@ function Invoke-Cycle($Ctx) {
     foreach ($tgt in $Cfg.RuHttp) { $async.Add((Start-Check 'RU_HTTP' 'http' $tgt)) }
     foreach ($tgt in $Cfg.IntlHttp) { $async.Add((Start-Check 'INTL_HTTP' 'http' $tgt)) }
     foreach ($tgt in $Cfg.CfHttp) { $async.Add((Start-Check 'CF_HTTP' 'http' $tgt)) }
-    $async.Add((Start-Check 'CF_BIG' 'big' $Cfg.CfBig))
+    # Прореживание: первый цикл, каждый N-й и все циклы, пока длится сбой Cloudflare
+    $cfBigDue = $Ctx.Cycle -le 1 -or (($Ctx.Cycle - 1) % $CfBigStep) -eq 0 -or $Ctx.LastVerdict -match 'CF_'
+    if ($cfBigDue) { $async.Add((Start-Check 'CF_BIG' 'big' $Cfg.CfBig)) }
     foreach ($tgt in $Cfg.SteamHttp) { $async.Add((Start-Check 'STEAM_HTTP' 'http' $tgt)) }
     foreach ($tgt in $Ctx.SteamCm) { $async.Add((Start-Check 'STEAM_CM' 'tcp' $tgt)) }
 
@@ -777,7 +783,7 @@ function Start-Monitor([int]$Minutes = 0) {
     Write-Host 'Прогревочный цикл (не пишется в лог: первый запуск HttpClient/TLS даёт ложные таймауты)...'
     $null = Invoke-Cycle $ctx
     $limitText = if ($Minutes) { "$Minutes мин" } else { 'до остановки' }
-    Write-Host "Мониторинг каждые $IntervalSec с ($limitText). Данные: $OutDir" -ForegroundColor Cyan
+    Write-Host "Мониторинг каждые $IntervalSec с ($limitText), Cloudflare 256 КБ - раз в $CfBigStep цикл(ов). Данные: $OutDir" -ForegroundColor Cyan
     Write-Host 'Остановить: Q, Esc или Ctrl+C - в конце будет итоговый отчёт' -ForegroundColor Cyan
 
     $sessionRows = [System.Collections.Generic.List[object]]::new()
