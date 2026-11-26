@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 <#
 .SYNOPSIS
     netmon: показывает, кто именно сломался: сетевая карта/роутер, провайдер, зарубежный канал/РКН,
@@ -10,7 +10,7 @@
     pwsh -File netmon.ps1 -Mode Check              # быстрая проверка: 3 цикла + итог "что работает, что нет"
     pwsh -File netmon.ps1 -Mode Snapshot [-Deep]   # сохранить маршруты/конфиг сети (+ pathping)
     pwsh -File netmon.ps1 -Mode Monitor [-DurationMin 60]
-    pwsh -File netmon.ps1 -Mode Report -Hours 24   # отчёт за последние 24 часа
+    pwsh -File netmon.ps1 -Mode Report -Hours 24 [-Out report.txt]
     pwsh -File netmon.ps1 -Mode Diff
     pwsh -File netmon.ps1 -Mode AutostartOn        # запускать мониторинг при входе в Windows (AutostartOff - выключить)
 #>
@@ -19,13 +19,16 @@ param(
     [ValidateSet('Menu', 'Check', 'Monitor', 'Snapshot', 'Report', 'Diff', 'AutostartOn', 'AutostartOff', 'Cleanup')]
     [string]$Mode = 'Menu',
     [string]$OutDir = (Join-Path $PSScriptRoot 'data'),
+    [ValidateRange(5, 3600)]
     [int]$IntervalSec = 15,
     [int]$CfBigEvery = -1,            # качать 256 КБ с Cloudflare раз в N циклов; -1 = из $Cfg
     [int]$DurationMin = 0,
     [int]$Hours = 0,                  # для Report: за сколько последних часов (0 = 7 дней или -Since)
     [datetime]$Since = (Get-Date).AddDays(-7),
+    [string]$Out = '',                # для Report: сохранить отчёт в файл
     [int]$RetentionDays = -1,         # хранить данные N дней; -1 = из $Cfg, 0 = не чистить
     [switch]$Deep,
+    [switch]$NoNotify,                # не показывать уведомления Windows при сбоях
     [switch]$NoPause                  # не ждать Enter в конце (для запуска из планировщика)
 )
 
@@ -37,6 +40,7 @@ $ErrorActionPreference = 'Stop'
 $Cfg = @{
     RuPing          = @('77.88.8.8', '77.88.8.1')                     # Яндекс DNS: точно внутри РФ
     IntlPing        = @('1.1.1.1', '8.8.8.8', '9.9.9.9')              # Cloudflare, Google, Quad9
+    Ipv6Ping        = @('2001:4860:4860::8888', '2606:4700:4700::1111')   # проверяется, только если есть глобальный IPv6
     DnsNames        = @('ya.ru', 'store.steampowered.com', 'api.steampowered.com', 'steamcommunity.com')
     RuHttp          = @('https://ya.ru/', 'https://vk.com/')
     IntlHttp        = @('https://www.google.com/generate_204', 'https://github.com/')
@@ -50,11 +54,20 @@ $Cfg = @{
         'https://api.steampowered.com/ISteamWebAPIUtil/GetServerInfo/v1/',
         'https://steamcommunity.com/'
     )
-    SteamCmFallback = @('cmp1-fra1.steamserver.net:27018', 'cmp1-fra2.steamserver.net:27020', 'cmp2-fra2.steamserver.net:27018')
+    # Steam иногда отдаёт CM в Далласе/Гонконге; клиент из РФ к ним не ходит. Берём только эти дата-центры (префикс поля dc)
+    SteamCmDcs      = @('sto', 'fra', 'ams', 'waw', 'hel', 'vie', 'lhr', 'par', 'mad')
+    SteamCmFallback = @('cmp1-fra1.steamserver.net:27018', 'cmp1-fra2.steamserver.net:27020', 'cmp2-sto1.steamserver.net:27022')
     IspHop          = ''        # IP первого хопа провайдера; пусто = определить автоматически через tracert
-    PublicIpEvery   = 20        # проверять внешний IP каждые N циклов (и после каждого восстановления)
+    PublicIpEvery   = 20        # проверять внешний IP каждые N циклов (и после восстановления от серьёзного сбоя)
     TraceCooldownS  = 300       # не чаще одного tracert на цель за N секунд
-    RetentionDays   = 10        # удалять CSV, трассировки, снапшоты и строки events.log старше N дней (0 = не удалять)
+    TracesPerFlag   = 2         # сколько целей трассировать на один флаг вердикта
+    LossMinFails    = 2         # LOSS: столько разных проверок не прошло в одном цикле, или одна и та же два цикла подряд
+    ReprobeEvery    = 40        # раз в N циклов заново проверять, не начали ли роутер/хоп провайдера отвечать на ping
+    Notify          = $true     # уведомления Windows о сбое и восстановлении
+    NotifyHardAfter = 2         # серьёзный сбой (провайдер, роутер, DNS, зарубеж): уведомить после N циклов подряд
+    NotifySoftAfter = 4         # Cloudflare / Steam / IPv6: после N циклов подряд (~1 мин)
+    ReportMinLoss   = 2         # в отчёте не показывать инциденты LOSS короче N циклов
+    RetentionDays   = 10        # удалять CSV, трассировки, снапшоты, отчёты и строки events.log старше N дней (0 = не удалять)
     KeepSnapshots   = 3         # сколько последних снапшотов хранить всегда, независимо от возраста
 }
 
@@ -73,11 +86,12 @@ $VerdictHelp = [ordered]@{
     'DNS'               = 'IP-адреса пингуются, но DNS не резолвит: DNS провайдера/роутера'
     'INTL_DOWN'         = 'РФ работает, зарубеж нет: внешний канал провайдера или ограничения ТСПУ/РКН'
     'CF_DOWN'           = 'зарубеж работает, Cloudflare нет'
-    'CF_THROTTLE'       = 'Cloudflare отвечает, но 256 КБ не качаются за 6 с: типичное замедление ТСПУ (обрыв после ~16 КБ)'
+    'CF_THROTTLE'       = 'Cloudflare отвечает, но 256 КБ не качаются за 6 с (зависание после части данных): типичное замедление ТСПУ'
     'STEAM_ALL'         = 'зарубеж работает, а Steam целиком (web + CM) нет: Steam лежит или блокировка'
     'STEAM_CM'          = 'CM-серверы Steam недоступны по TCP: клиент Steam уходит в "нет соединения", магазин может работать'
     'STEAM_WEB'         = 'store/community/api не открываются, CM-серверы доступны'
-    'LOSS'              = 'часть проверок не прошла (потери/единичные таймауты)'
+    'IPV6'              = 'IPv4 работает, IPv6 нет: проблема IPv6 у провайдера или роутера'
+    'LOSS'              = 'не прошло несколько проверок или одна и та же два цикла подряд (потери/таймауты)'
     'NO_DATA'           = 'монитор не работал (сон ПК, закрыт скрипт)'
 }
 
@@ -93,13 +107,45 @@ $CatNames = [ordered]@{
     CF_BIG     = 'Cloudflare 256 КБ (замедление ТСПУ)'
     STEAM_HTTP = 'Steam: магазин / community / API'
     STEAM_CM   = 'Steam: серверы подключения клиента (CM)'
+    IPV6       = 'IPv6: ping (Google, Cloudflare)'
 }
 
 $HardVerdicts = @('LINK_DOWN', 'LAN_ROUTER', 'PROVIDER_EDGE', 'PROVIDER_UPSTREAM', 'PROVIDER', 'DNS', 'INTL_DOWN')
 
+# Какие категории проверок объясняет каждый флаг вердикта (для трассировок и LOSS)
+$FlagCats = @{
+    CF_DOWN     = @('CF_HTTP', 'CF_BIG')
+    CF_THROTTLE = @('CF_BIG')
+    STEAM_ALL   = @('STEAM_HTTP', 'STEAM_CM')
+    STEAM_CM    = @('STEAM_CM')
+    STEAM_WEB   = @('STEAM_HTTP')
+    IPV6        = @('IPV6')
+}
+
+$SocketErrorCodes = @{
+    ConnectionReset    = 'reset'
+    ConnectionAborted  = 'reset'
+    TimedOut           = 'timeout'
+    ConnectionRefused  = 'refused'
+    HostNotFound       = 'dns'
+    NoData             = 'dns'
+    TryAgain           = 'dns'
+    NetworkUnreachable = 'unreachable'
+    HostUnreachable    = 'unreachable'
+    NetworkDown        = 'unreachable'
+}
+
+$HttpRequestErrors = @{
+    NameResolutionError   = 'dns'
+    SecureConnectionError = 'tls'
+    ResponseEnded         = 'eof'
+    ProxyTunnelError      = 'proxy'
+}
+
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $EventsFile = Join-Path $OutDir 'events.log'
 $TracesDir = Join-Path $OutDir 'traces'
+$ReportsDir = Join-Path $OutDir 'reports'
 
 # HttpClient без прокси (проверяем реальный путь) и без keep-alive (каждый раз новый TCP+TLS, чтобы DPI был виден)
 $Handler = [System.Net.Http.HttpClientHandler]::new()
@@ -108,9 +154,31 @@ $Handler.AllowAutoRedirect = $false
 $Http = [System.Net.Http.HttpClient]::new($Handler)
 $Http.Timeout = [TimeSpan]::FromSeconds(8)
 $Http.DefaultRequestHeaders.ConnectionClose = $true
-$Http.DefaultRequestHeaders.UserAgent.ParseAdd('Mozilla/5.0 (Windows NT 10.0; Win64; x64) netmon/1.0')
+$Http.DefaultRequestHeaders.UserAgent.ParseAdd('Mozilla/5.0 (Windows NT 10.0; Win64; x64) netmon/1.1')
 $Http.DefaultRequestHeaders.CacheControl = [System.Net.Http.Headers.CacheControlHeaderValue]::new()
 $Http.DefaultRequestHeaders.CacheControl.NoCache = $true
+
+# Загрузка с подсчётом полученных байт: при замедлении ТСПУ видно, на каком объёме соединение "замёрзло"
+if (-not ('NetmonDownload' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+public static class NetmonDownload {
+    public static async Task<long> Run(HttpClient client, string url, long[] progress, CancellationToken token) {
+        using var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+        resp.EnsureSuccessStatusCode();
+        using var stream = await resp.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+        var buffer = new byte[16384];
+        int read;
+        while ((read = await stream.ReadAsync(buffer, 0, buffer.Length, token).ConfigureAwait(false)) > 0) {
+            Interlocked.Add(ref progress[0], read);
+        }
+        return Interlocked.Read(ref progress[0]);
+    }
+}
+'@
+}
 
 # Запуск консольной утилиты с сохранением вывода в UTF-8 файл.
 # Утилиты Windows пишут кто в UTF-8, кто в OEM (cp866), кто в ANSI (cp1251) - берём сырые байты и определяем сами.
@@ -148,27 +216,49 @@ $SaveNativeOutput = {
 # ----------------------------------------------------------------------------------------------------------------
 # Утилиты
 # ----------------------------------------------------------------------------------------------------------------
-function Write-NetEvent([string]$Text, [string]$Color = 'Cyan') {
-    $line = '{0:yyyy-MM-dd HH:mm:ss} {1}' -f (Get-Date), $Text
+function Write-NetEvent([string]$Text, [string]$Color = 'Cyan', [string]$Time = '') {
+    # $Time: время цикла из строки CSV, чтобы события совпадали со строками cycles_*.csv
+    $stamp = if ($Time) { $Time } else { '{0:yyyy-MM-dd HH:mm:ss}' -f (Get-Date) }
+    $line = '{0} {1}' -f $stamp, $Text
     Add-Content -Path $EventsFile -Value $line -Encoding utf8
     Write-Host "  >> $line" -ForegroundColor $Color
 }
 
 function Get-ShortError([Exception]$Ex) {
-    $parts = @()
-    $cur = $Ex
-    while ($cur) { $parts += "$($cur.GetType().Name): $($cur.Message)"; $cur = $cur.InnerException }
-    $text = $parts -join ' | '
+    # Классификация по типам и кодам ошибок, а не по тексту: на русской Windows тексты локализованы
+    $chain = [System.Collections.Generic.List[Exception]]::new()
+    for ($cur = $Ex; $cur; $cur = $cur.InnerException) { $chain.Add($cur) }
+
+    $inTls = [bool]($chain | Where-Object {
+        $_ -is [System.Security.Authentication.AuthenticationException] -or
+        ($_ -is [System.Net.Http.HttpRequestException] -and "$($_.HttpRequestError)" -eq 'SecureConnectionError')
+    })
+    foreach ($item in $chain) {
+        if ($item -is [System.Net.Sockets.SocketException] -and ($code = $SocketErrorCodes["$($item.SocketErrorCode)"])) {
+            if ($code -eq 'reset' -and $inTls) { return 'tls_reset' }     # обрыв во время TLS-рукопожатия: типичный DPI по SNI
+            return $code
+        }
+    }
+    foreach ($item in $chain) {
+        if ($item -is [System.OperationCanceledException] -or $item -is [System.TimeoutException]) { return 'timeout' }
+    }
+    foreach ($item in $chain) {
+        if ($item -is [System.Net.Http.HttpRequestException] -and ($code = $HttpRequestErrors["$($item.HttpRequestError)"])) { return $code }
+    }
+    if ($inTls) { return 'tls' }
+
+    # запасной вариант для английских текстов (PingException и прочее без кодов)
+    $text = ($chain | ForEach-Object { "$($_.GetType().Name): $($_.Message)" }) -join ' | '
     switch -Regex ($text) {
-        'TaskCanceled|OperationCanceled|timed? ?out|Timeout' { return 'timeout' }
-        'forcibly closed|reset by peer|ConnectionReset|10054' { return 'reset' }
+        'timed? ?out|Timeout' { return 'timeout' }
+        'forcibly closed|reset by peer|10054' { return 'reset' }
         'refused|10061' { return 'refused' }
-        'No such host|NameResolution|11001|nodename|Name or service' { return 'dns' }
-        'Authentication|SSL|TLS|certificate|handshake' { return 'tls' }
+        'No such host|11001|nodename' { return 'dns' }
         'unreachable|10051|10065' { return 'unreachable' }
         'unexpected EOF|0 bytes from the transport' { return 'eof' }
     }
-    $msg = ($parts | Select-Object -Last 1) -replace '\s+', ' '
+    $last = $chain[$chain.Count - 1]
+    $msg = ('{0}: {1}' -f $last.GetType().Name, $last.Message) -replace '\s+', ' '
     if ($msg.Length -gt 80) { $msg = $msg.Substring(0, 80) }
     return $msg
 }
@@ -197,6 +287,21 @@ function Get-ActiveRoute {
     }
 }
 
+function Test-RouteChanged($Ctx, $Route) {
+    return [bool]($Route -and ($Route.IfIndex -ne $Ctx.IfIndex -or "$($Route.Gateway)" -ne "$($Ctx.Gateway)"))
+}
+
+function Test-Ipv6Available {
+    # маршрут ::/0 бывает и без глобального адреса (как сейчас у многих провайдеров) - тогда IPv6 не проверяем
+    $routes = @(Get-NetRoute -DestinationPrefix '::/0' -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object NextHop -NE '::')
+    foreach ($route in $routes) {
+        $global = Get-NetIPAddress -InterfaceIndex $route.ifIndex -AddressFamily IPv6 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -match '^[23][0-9a-f]{3}:' -and $_.AddressState -eq 'Preferred' }
+        if ($global) { return $true }
+    }
+    return $false
+}
+
 function ConvertFrom-Tracert([string[]]$Lines) {
     $hops = foreach ($line in $Lines) {
         if ($line -match '^\s*(\d+)\s+\S') {
@@ -214,51 +319,80 @@ function Find-IspHop([string[]]$TraceLines, [string]$Gateway) {
     return ($hops | Where-Object { $_.Ip -ne '*' -and $_.Ip -ne $Gateway -and -not (Test-PrivateIp $_.Ip) } | Select-Object -First 1).Ip
 }
 
+function Resolve-IspHop([string]$Gateway) {
+    # короткий tracert (6 хопов), чтобы найти первый хоп провайдера за несколько секунд
+    if ($Cfg.IspHop) { return $Cfg.IspHop }
+    $traceLines = & tracert.exe -d -w 700 -h 6 '77.88.8.8'
+    return Find-IspHop $traceLines $Gateway
+}
+
 function Test-Pingable([string]$Target) {
     $pinger = [System.Net.NetworkInformation.Ping]::new()
-    foreach ($attempt in 1..3) {
-        try { if ($pinger.Send($Target, 1000).Status -eq 'Success') { return $true } } catch { }
+    try {
+        foreach ($attempt in 1..3) {
+            try { if ($pinger.Send($Target, 1000).Status -eq 'Success') { return $true } } catch { }
+        }
+        return $false
+    } finally {
+        $pinger.Dispose()
     }
-    return $false
 }
 
 function Get-PublicIp {
     foreach ($url in 'https://api.ipify.org', 'https://www.cloudflare.com/cdn-cgi/trace', 'https://ifconfig.me/ip') {
+        $cts = [Threading.CancellationTokenSource]::new(5000)
         try {
-            $cts = [Threading.CancellationTokenSource]::new(5000)
             $text = $Http.GetStringAsync($url, $cts.Token).GetAwaiter().GetResult()
             if ($text -match '(?m)^(?:ip=)?(\d{1,3}(?:\.\d{1,3}){3})\s*$') { return $Matches[1] }
-        } catch { }
+        } catch { } finally { $cts.Dispose() }
     }
     return ''
 }
 
+function Select-SteamCmEndpoints($ServerList, [string[]]$DcPrefixes) {
+    # до 3 websockets-CM из разных ближних дата-центров + до 2 netfilter (UDP/TCP 27017+)
+    $near = @($ServerList | Where-Object { $_.endpoint -and $_.dc -and (($_.dc -replace '\d+$', '') -in $DcPrefixes) })
+    $ws = @($near | Where-Object type -EQ 'websockets' | Group-Object dc | ForEach-Object { $_.Group[0] } | Select-Object -First 3)
+    $nf = @($near | Where-Object type -EQ 'netfilter' | Select-Object -First 2)
+    return @(@($ws) + @($nf) | ForEach-Object { [pscustomobject]@{ endpoint = $_.endpoint; dc = $_.dc; type = $_.type } })
+}
+
 function Get-SteamCmEndpoints {
     $cache = Join-Path $OutDir 'steam_cm.json'
+    $cts = [Threading.CancellationTokenSource]::new(8000)
     try {
-        $cts = [Threading.CancellationTokenSource]::new(8000)
         $raw = $Http.GetStringAsync('https://api.steampowered.com/ISteamDirectory/GetCMListForConnect/v1/?cellid=0', $cts.Token).GetAwaiter().GetResult()
-        $list = ($raw | ConvertFrom-Json).response.serverlist
-        $ws = $list | Where-Object type -EQ 'websockets' | Group-Object dc | ForEach-Object { $_.Group[0].endpoint } | Select-Object -First 3
-        $nf = $list | Where-Object type -EQ 'netfilter' | Select-Object -First 2 -ExpandProperty endpoint
-        $endpoints = @(@($ws) + @($nf) | Where-Object { $_ })
-        if ($endpoints.Count) {
-            $endpoints | ConvertTo-Json | Set-Content -Path $cache -Encoding utf8
-            return $endpoints
+        $list = @(($raw | ConvertFrom-Json).response.serverlist)
+        $selected = @(Select-SteamCmEndpoints $list $Cfg.SteamCmDcs)
+        if ($selected.Count) {
+            ConvertTo-Json -InputObject $selected | Set-Content -Path $cache -Encoding utf8
+            return @($selected.endpoint)
         }
+        $dcs = ($list.dc | Select-Object -Unique) -join ','
+        Write-Host "  Steam отдал CM только в дальних дата-центрах ($dcs), беру кэш/fallback" -ForegroundColor Yellow
     } catch {
         Write-Host "  Не удалось получить список CM Steam ($(Get-ShortError $_.Exception)), беру кэш/fallback" -ForegroundColor Yellow
+    } finally {
+        $cts.Dispose()
     }
-    if (Test-Path $cache) { return @(Get-Content $cache -Raw | ConvertFrom-Json) }
+    if (Test-Path $cache) {
+        # старый формат кэша (просто строки без dc) отбрасывается фильтром
+        $cached = @(Select-SteamCmEndpoints @(Get-Content $cache -Raw | ConvertFrom-Json) $Cfg.SteamCmDcs)
+        if ($cached.Count) { return @($cached.endpoint) }
+    }
     return $Cfg.SteamCmFallback
+}
+
+function Get-CheckHost($Check) {
+    return $Check.Target -replace '^https?://', '' -replace '/.*$', '' -replace ':\d+$', ''
 }
 
 function Start-Trace([string]$Target, [string]$Reason) {
     New-Item -ItemType Directory -Force -Path $TracesDir | Out-Null
     $safe = $Target -replace '[^\w\.-]', '_'
     $file = Join-Path $TracesDir ('{0:yyyyMMdd_HHmmss}_{1}_{2}.txt' -f (Get-Date), $Reason, $safe)
-    $null = Start-ThreadJob -ScriptBlock $SaveNativeOutput -ArgumentList $file, 'tracert.exe', @('-d', '-w', '800', '-h', '25', $Target)
-    return $file
+    $job = Start-ThreadJob -ScriptBlock $SaveNativeOutput -ArgumentList $file, 'tracert.exe', @('-d', '-w', '800', '-h', '25', $Target)
+    return [pscustomobject]@{ File = $file; Job = $job }
 }
 
 function Read-Number([string]$Prompt, [int]$Default) {
@@ -293,7 +427,9 @@ function Invoke-Cleanup([int]$Days, [switch]$Loud) {
     $border = (Get-Date).AddDays(-$Days)
     $removed = 0
     $oldFiles = @(Get-ChildItem $OutDir -Filter 'cycles_*.csv' -File -ErrorAction SilentlyContinue)
-    if (Test-Path $TracesDir) { $oldFiles += Get-ChildItem $TracesDir -File }
+    foreach ($dir in $TracesDir, $ReportsDir) {
+        if (Test-Path $dir) { $oldFiles += Get-ChildItem $dir -File }
+    }
     foreach ($file in $oldFiles | Where-Object LastWriteTime -LT $border) { Remove-Item $file.FullName -Force; $removed++ }
 
     $snapRoot = Join-Path $OutDir 'snapshots'
@@ -362,10 +498,46 @@ function Wait-OrQuit([int]$Ms, [bool]$CanReadKeys) {
     return $false
 }
 
+function Enter-MonitorLock {
+    # один мониторинг на папку данных: второй экземпляр писал бы в те же CSV и events.log
+    $fullPath = [IO.Path]::GetFullPath($OutDir).TrimEnd('\').ToLowerInvariant()
+    $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($fullPath))).Substring(0, 16)
+    $mutex = [Threading.Mutex]::new($false, "Local\netmon-monitor-$hash")
+    try {
+        $acquired = $mutex.WaitOne(0)
+    } catch [Threading.AbandonedMutexException] {
+        $acquired = $true      # прошлый экземпляр упал, не освободив блокировку
+    }
+    if ($acquired) { return $mutex }
+    $mutex.Dispose()
+    return $null
+}
+
+function New-Notifier {
+    if ($NoNotify -or -not $Cfg.Notify) { return $null }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+        $icon = [System.Windows.Forms.NotifyIcon]::new()
+        $icon.Icon = [System.Drawing.SystemIcons]::Information
+        $icon.Text = 'netmon'
+        $icon.Visible = $true
+        return $icon
+    } catch {
+        Write-Host "  Уведомления Windows недоступны: $($_.Exception.Message)" -ForegroundColor DarkGray
+        return $null
+    }
+}
+
+function Send-Notification($Notifier, [string]$Title, [string]$Text, [string]$Kind = 'Warning') {
+    if (-not $Notifier) { return }
+    try { $Notifier.ShowBalloonTip(10000, $Title, $Text, [System.Windows.Forms.ToolTipIcon]::$Kind) } catch { }
+}
+
 # ----------------------------------------------------------------------------------------------------------------
 # Snapshot / Diff
 # ----------------------------------------------------------------------------------------------------------------
-function Save-Snapshot([switch]$WithPathping) {
+function Start-Snapshot([switch]$WithPathping) {
+    # Быстрая часть (конфиг) синхронно, трассировки - в фоновых ThreadJob. Дописывает Complete-Snapshot
     $dir = Join-Path $OutDir ('snapshots\{0:yyyyMMdd_HHmmss}' -f (Get-Date))
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     Write-Host "Снапшот сети -> $dir" -ForegroundColor Cyan
@@ -382,41 +554,73 @@ function Save-Snapshot([switch]$WithPathping) {
     $route = Get-ActiveRoute
     $cms = Get-SteamCmEndpoints
     $cmHost = ($cms | Select-Object -First 1) -replace ':\d+$', ''
-    $targets = @('77.88.8.8', '1.1.1.1', '8.8.8.8', 'store.steampowered.com', 'speed.cloudflare.com', $cmHost)
+    # имя файла -> цель; CM пишется в постоянный tracert_steam_cm.txt, чтобы Diff мог сравнить снапшоты
+    $targets = [ordered]@{
+        '77.88.8.8'              = '77.88.8.8'
+        '1.1.1.1'                = '1.1.1.1'
+        '8.8.8.8'                = '8.8.8.8'
+        'store.steampowered.com' = 'store.steampowered.com'
+        'speed.cloudflare.com'   = 'speed.cloudflare.com'
+    }
+    if ($cmHost) { $targets['steam_cm'] = $cmHost }
 
-    Write-Host "  tracert к $($targets -join ', ') (параллельно, до ~1.5 мин)..."
-    $jobs = @(foreach ($tgt in $targets) {
-        $file = Join-Path $dir ('tracert_{0}.txt' -f ($tgt -replace '[^\w\.-]', '_'))
-        Start-ThreadJob -ScriptBlock $SaveNativeOutput -ArgumentList $file, 'tracert.exe', @('-d', '-w', '800', '-h', '25', $tgt)
+    Write-Host "  tracert к $($targets.Values -join ', ') (параллельно, до ~1.5 мин)..."
+    $jobs = @(foreach ($name in $targets.Keys) {
+        Start-ThreadJob -ScriptBlock $SaveNativeOutput -ArgumentList (Join-Path $dir "tracert_$name.txt"), 'tracert.exe', @('-d', '-w', '800', '-h', '25', $targets[$name])
     })
     if ($WithPathping) {
         Write-Host '  pathping к 1.1.1.1 и Steam CM (несколько минут)...'
-        $jobs += foreach ($tgt in @('1.1.1.1', $cmHost)) {
-            $file = Join-Path $dir ('pathping_{0}.txt' -f ($tgt -replace '[^\w\.-]', '_'))
-            Start-ThreadJob -ScriptBlock $SaveNativeOutput -ArgumentList $file, 'pathping.exe', @('-n', '-q', '50', '-w', '500', $tgt)
+        $pathTargets = [ordered]@{ '1.1.1.1' = '1.1.1.1' }
+        if ($cmHost) { $pathTargets['steam_cm'] = $cmHost }
+        $jobs += foreach ($name in $pathTargets.Keys) {
+            Start-ThreadJob -ScriptBlock $SaveNativeOutput -ArgumentList (Join-Path $dir "pathping_$name.txt"), 'pathping.exe', @('-n', '-q', '50', '-w', '500', $pathTargets[$name])
         }
     }
-    $publicIp = Get-PublicIp
-    $jobs | Wait-Job | Remove-Job
+    return [pscustomobject]@{ Dir = $dir; Jobs = $jobs; Route = $route; SteamCm = $cms; PublicIp = '' }
+}
 
+function Complete-Snapshot($Pending, [switch]$Wait) {
+    # без -Wait: $null, пока трассировки ещё идут
+    if (-not $Wait -and ($Pending.Jobs | Where-Object { $_.State -in 'NotStarted', 'Running' })) { return $null }
+    $Pending.Jobs | Wait-Job | Remove-Job -Force
+    if (-not $Pending.PublicIp) { $Pending.PublicIp = Get-PublicIp }
+    $route = $Pending.Route
+    $traceFile = Join-Path $Pending.Dir 'tracert_77.88.8.8.txt'
     $summary = [ordered]@{
         Time      = '{0:yyyy-MM-dd HH:mm:ss}' -f (Get-Date)
         Interface = $route.Alias
         Adapter   = $route.Description
         Gateway   = $route.Gateway
         Dns       = $route.Dns
-        IspHop    = Find-IspHop (Get-Content (Join-Path $dir 'tracert_77.88.8.8.txt')) $route.Gateway
-        PublicIp  = $publicIp
-        SteamCm   = $cms
+        IspHop    = $(if (Test-Path $traceFile) { Find-IspHop (Get-Content $traceFile) $route.Gateway } else { $Cfg.IspHop })
+        PublicIp  = $Pending.PublicIp
+        SteamCm   = $Pending.SteamCm
     }
-    $summary | ConvertTo-Json | Set-Content (Join-Path $dir 'summary.json') -Encoding utf8
-    Write-Host ''
-    foreach ($key in $summary.Keys) { Write-Host ('  {0,-10} {1}' -f $key, ($summary[$key] -join ', ')) }
+    $summary | ConvertTo-Json | Set-Content (Join-Path $Pending.Dir 'summary.json') -Encoding utf8
+    if ($Wait) {
+        Write-Host ''
+        foreach ($key in $summary.Keys) { Write-Host ('  {0,-10} {1}' -f $key, ($summary[$key] -join ', ')) }
+    }
     return [pscustomobject]$summary
 }
 
+function Stop-Snapshot($Pending) {
+    # мониторинг остановили раньше, чем закончились трассировки: недоделанный снапшот не оставляем
+    $Pending.Jobs | Stop-Job -ErrorAction SilentlyContinue
+    $Pending.Jobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    Remove-Item $Pending.Dir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Save-Snapshot([switch]$WithPathping) {
+    $pending = Start-Snapshot -WithPathping:$WithPathping
+    $pending.PublicIp = Get-PublicIp       # пока идут трассировки
+    return Complete-Snapshot $pending -Wait
+}
+
 function Compare-Snapshots {
-    $snaps = @(Get-ChildItem (Join-Path $OutDir 'snapshots') -Directory -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 2)
+    # только завершённые снапшоты (с summary.json)
+    $snaps = @(Get-ChildItem (Join-Path $OutDir 'snapshots') -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName 'summary.json') } | Sort-Object Name | Select-Object -Last 2)
     if ($snaps.Count -lt 2) { Write-Host 'Нужно минимум 2 снапшота (пункт "Снапшот" в меню)'; return }
     $old, $new = $snaps
     Write-Host "Сравнение $($old.Name) -> $($new.Name)" -ForegroundColor Cyan
@@ -430,7 +634,16 @@ function Compare-Snapshots {
     }
     foreach ($file in Get-ChildItem $new.FullName -Filter 'tracert_*.txt') {
         $oldFile = Join-Path $old.FullName $file.Name
-        if (-not (Test-Path $oldFile)) { continue }
+        if ($file.Name -eq 'tracert_steam_cm.txt') {
+            if (-not (Test-Path $oldFile)) {
+                # снапшоты старой версии: файл назывался по имени CM-хоста
+                $oldFile = (Get-ChildItem $old.FullName -Filter 'tracert_cmp*.txt' | Select-Object -First 1).FullName
+            }
+            $cmOld = ($sumOld.SteamCm | Select-Object -First 1) -replace ':\d+$', ''
+            $cmNew = ($sumNew.SteamCm | Select-Object -First 1) -replace ':\d+$', ''
+            if ($cmOld -ne $cmNew) { Write-Host "  Steam CM: цель трассировки сменилась $cmOld -> $cmNew, маршруты сравнимы условно" -ForegroundColor DarkYellow }
+        }
+        if (-not $oldFile -or -not (Test-Path $oldFile)) { continue }
         $hopsOld = ConvertFrom-Tracert (Get-Content $oldFile)
         $hopsNew = ConvertFrom-Tracert (Get-Content $file.FullName)
         $maxHop = [Math]::Max($hopsOld.Count, $hopsNew.Count)
@@ -455,44 +668,78 @@ function Initialize-Context($Summary, [string]$Label = 'START') {
     }
     $ispHop = if ($Summary.IspHop) { $Summary.IspHop } else { $Cfg.IspHop }
     $ctx = [pscustomobject]@{
-        IfIndex     = $route.IfIndex
-        Alias       = $route.Alias
-        Gateway     = $route.Gateway
-        Dns         = $route.Dns
-        GwPingable  = Test-Pingable $route.Gateway
-        IspHop      = $ispHop
-        IspPingable = [bool]($ispHop -and (Test-Pingable $ispHop))
-        SteamCm     = @($Summary.SteamCm)
-        PublicIp    = $Summary.PublicIp
-        Cycle       = 0
-        LastVerdict = 'START'
-        LastLink    = 'Up'
-        LastTrace   = @{}
+        IfIndex         = $route.IfIndex
+        Alias           = $route.Alias
+        Gateway         = $route.Gateway
+        Dns             = $route.Dns
+        GwPingable      = Test-Pingable $route.Gateway
+        IspHop          = $ispHop
+        IspPingable     = [bool]($ispHop -and (Test-Pingable $ispHop))
+        HasIpv6         = Test-Ipv6Available
+        SteamCm         = @($Summary.SteamCm)
+        PublicIp        = $Summary.PublicIp
+        Cycle           = 0
+        LastVerdict     = 'START'
+        LastLink        = 'Up'
+        LastTrace       = @{}
+        TraceJobs       = [System.Collections.Generic.List[object]]::new()
+        PrevUnexplained = @()
+        BadStreak       = 0
+        BadSince        = ''
+        NotifiedVerdict = ''
+        Notifier        = $null
     }
-    if (-not $ctx.GwPingable) { Write-Host "Роутер $($ctx.Gateway) не отвечает на ping: проверка роутера отключена" -ForegroundColor Yellow }
+    if (-not $ctx.GwPingable) { Write-Host "Роутер $($ctx.Gateway) не отвечает на ping: проверка роутера отключена (перепроверка раз в $($Cfg.ReprobeEvery) циклов)" -ForegroundColor Yellow }
     if ($ispHop -and -not $ctx.IspPingable) { Write-Host "Первый хоп провайдера $ispHop не отвечает на ping: PROVIDER_EDGE/UPSTREAM различать не будем" -ForegroundColor Yellow }
-    Write-NetEvent ("{0} iface='{1}' gw={2} dns={3} isp_hop={4} public_ip={5} steam_cm={6}" -f
-        $Label, $ctx.Alias, $ctx.Gateway, $ctx.Dns, $ispHop, $ctx.PublicIp, ($ctx.SteamCm -join ','))
+    Write-NetEvent ("{0} iface='{1}' gw={2} dns={3} isp_hop={4} ipv6={5} public_ip={6} steam_cm={7}" -f
+        $Label, $ctx.Alias, $ctx.Gateway, $ctx.Dns, $ispHop, $ctx.HasIpv6, $ctx.PublicIp, ($ctx.SteamCm -join ','))
     return $ctx
+}
+
+function Update-Context($Ctx, $Route) {
+    # Сменился маршрут по умолчанию (кабель <-> Wi-Fi, VPN, другой роутер): всё, что привязано к старому, пересчитываем
+    Write-NetEvent ("ROUTE_CHANGE '{0}' gw {1} -> '{2}' gw {3}" -f $Ctx.Alias, $Ctx.Gateway, $Route.Alias, $Route.Gateway) 'Magenta'
+    $summary = [pscustomobject]@{ IspHop = Resolve-IspHop $Route.Gateway; SteamCm = $Ctx.SteamCm; PublicIp = $Ctx.PublicIp }
+    $new = Initialize-Context $summary 'ROUTE'
+    foreach ($field in 'Cycle', 'LastVerdict', 'LastLink', 'LastTrace', 'TraceJobs', 'PrevUnexplained', 'BadStreak', 'BadSince', 'NotifiedVerdict', 'Notifier') {
+        $new.$field = $Ctx.$field
+    }
+    return $new
+}
+
+function Update-Reachability($Ctx) {
+    # роутер/хоп провайдера могли не ответить на ping при старте случайно
+    if (-not $Ctx.GwPingable -and (Test-Pingable $Ctx.Gateway)) {
+        $Ctx.GwPingable = $true
+        Write-NetEvent "PROBE роутер $($Ctx.Gateway) отвечает на ping: проверка роутера включена" 'DarkCyan'
+    }
+    if ($Ctx.IspHop -and -not $Ctx.IspPingable -and (Test-Pingable $Ctx.IspHop)) {
+        $Ctx.IspPingable = $true
+        Write-NetEvent "PROBE хоп провайдера $($Ctx.IspHop) отвечает на ping: PROVIDER_EDGE/UPSTREAM различаются" 'DarkCyan'
+    }
 }
 
 function Start-Check([string]$Cat, [string]$Kind, [string]$Target) {
     $chk = [pscustomobject]@{
-        Cat = $Cat; Kind = $Kind; Target = $Target; Task = $null; Client = $null; Cts = $null
+        Cat = $Cat; Kind = $Kind; Target = $Target; Task = $null; Client = $null; Cts = $null; Progress = $null
         Sw = [Diagnostics.Stopwatch]::StartNew(); DoneMs = $null; Ok = $false; Ms = $null; Err = ''
     }
     try {
         switch ($Kind) {
-            'ping' { $chk.Task = [System.Net.NetworkInformation.Ping]::new().SendPingAsync($Target, 1500) }
+            'ping' {
+                $chk.Client = [System.Net.NetworkInformation.Ping]::new()
+                $chk.Task = $chk.Client.SendPingAsync($Target, 1500)
+            }
             'tcp' {
-                $hostName, $port = $Target -split ':'
+                $hostName, $port = $Target -split ':(?=\d+$)'
                 $chk.Client = [System.Net.Sockets.TcpClient]::new()
                 $chk.Task = $chk.Client.ConnectAsync($hostName, [int]$port)
             }
             'http' { $chk.Task = $Http.GetAsync($Target, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead) }
             'big' {
                 $chk.Cts = [Threading.CancellationTokenSource]::new($Cfg.CfBigTimeoutMs)
-                $chk.Task = $Http.GetByteArrayAsync($Target, $chk.Cts.Token)
+                $chk.Progress = [long[]]::new(1)
+                $chk.Task = [NetmonDownload]::Run($Http, $Target, $chk.Progress, $chk.Cts.Token)
             }
         }
     } catch { $chk.Err = Get-ShortError $_.Exception }
@@ -522,6 +769,8 @@ function Complete-Check($Chk) {
         if ($Chk.Client) { $Chk.Client.Dispose() }
         if ($Chk.Cts) { $Chk.Cts.Dispose() }
     }
+    # 256 КБ: сколько успело прийти до обрыва/таймаута. timeout@16384 = классическое "замерзание" ТСПУ
+    if (-not $Chk.Ok -and $Chk.Kind -eq 'big' -and $Chk.Progress -and $Chk.Progress[0] -gt 0) { $Chk.Err += "@$($Chk.Progress[0])" }
     if ($Chk.Ok -and $null -eq $Chk.Ms) { $Chk.Ms = $Chk.DoneMs }
 }
 
@@ -552,21 +801,67 @@ function Format-Cat($Checks) {
     return $text
 }
 
-function Invoke-Cycle($Ctx) {
-    $now = Get-Date
-    $route = Get-ActiveRoute
-    $adapter = Get-NetAdapter -InterfaceIndex $Ctx.IfIndex -ErrorAction SilentlyContinue
-    $link = if ($adapter) { "$($adapter.Status)" } else { 'Missing' }
-    $dnsServer = if ($route -and $route.Dns) { $route.Dns } else { $Ctx.Dns }
+function Get-Verdict {
+    # Чистая функция: по результатам проверок одного цикла -> вердикт. Покрыта тестами в tests\
+    param(
+        $Checks,
+        [string]$Link = 'Up',
+        [bool]$HasRoute = $true,
+        [bool]$IspPingable = $true,
+        [string[]]$PrevUnexplained = @(),
+        [int]$LossMinFails = $Cfg.LossMinFails
+    )
+    $byCat = @{}
+    foreach ($grp in @($Checks) | Where-Object { $_ } | Group-Object Cat) { $byCat[$grp.Name] = @($grp.Group) }
+    $noneOk = { param($cat) $byCat.ContainsKey($cat) -and -not ($byCat[$cat] | Where-Object Ok) }
+    $someOk = { param($cat) $byCat.ContainsKey($cat) -and [bool]($byCat[$cat] | Where-Object Ok) }
+    $result = { param($verdict, $unexplained) [pscustomobject]@{ Verdict = $verdict; Unexplained = @($unexplained) } }
 
-    $checks = [System.Collections.Generic.List[object]]::new()
-    foreach ($chk in Invoke-DnsChecks $dnsServer) { $checks.Add($chk) }
+    if ($Link -ne 'Up' -or -not $HasRoute) { return & $result 'LINK_DOWN' @() }
+    if (& $noneOk 'GW') { return & $result 'LAN_ROUTER' @() }
+    if ((& $noneOk 'RU_PING') -and (& $noneOk 'INTL_PING') -and (& $noneOk 'RU_HTTP')) {
+        $provider = if (-not $IspPingable) { 'PROVIDER' } elseif (& $someOk 'ISP') { 'PROVIDER_UPSTREAM' } else { 'PROVIDER_EDGE' }
+        return & $result $provider @()
+    }
+    if ((& $noneOk 'DNS') -and (& $someOk 'RU_PING')) { return & $result 'DNS' @() }
+    if (((& $someOk 'RU_PING') -or (& $someOk 'RU_HTTP')) -and (& $noneOk 'INTL_PING') -and (& $noneOk 'INTL_HTTP')) {
+        return & $result 'INTL_DOWN' @()
+    }
+
+    $flags = [System.Collections.Generic.List[string]]::new()
+    if (& $noneOk 'CF_HTTP') { $flags.Add('CF_DOWN') }
+    elseif ((& $noneOk 'CF_BIG') -and ($byCat['CF_BIG'] | Where-Object { $_.Err -like 'timeout*' })) { $flags.Add('CF_THROTTLE') }
+    if ((& $noneOk 'STEAM_HTTP') -and (& $noneOk 'STEAM_CM')) { $flags.Add('STEAM_ALL') }
+    elseif (& $noneOk 'STEAM_CM') { $flags.Add('STEAM_CM') }
+    elseif (& $noneOk 'STEAM_HTTP') { $flags.Add('STEAM_WEB') }
+    if (& $noneOk 'IPV6') { $flags.Add('IPV6') }
+
+    $explained = @($flags | ForEach-Object { $FlagCats[$_] })
+    $unexplained = @(@($Checks) | Where-Object { $_ -and -not $_.Ok -and $_.Cat -notin $explained } |
+        ForEach-Object { '{0}|{1}' -f $_.Cat, $_.Target } | Select-Object -Unique)
+    # одиночный сбой одной проверки (8.8.8.8 режет ICMP, api.steampowered.com иногда медлит) - не LOSS
+    $repeated = @($unexplained | Where-Object { $_ -in $PrevUnexplained })
+    if ($unexplained.Count -ge $LossMinFails -or $repeated.Count) { $flags.Add('LOSS') }
+
+    $verdict = if ($flags.Count) { $flags -join '+' } else { 'OK' }
+    return & $result $verdict $unexplained
+}
+
+function Invoke-Cycle($Ctx, $Route) {
+    $now = Get-Date
+    if ($null -eq $Route) { $Route = Get-ActiveRoute }
+    # линк смотрим у адаптера текущего маршрута: при переходе кабель -> Wi-Fi старый адаптер Disconnected, а сеть есть
+    $ifIndex = if ($Route) { $Route.IfIndex } else { $Ctx.IfIndex }
+    $adapter = Get-NetAdapter -InterfaceIndex $ifIndex -ErrorAction SilentlyContinue
+    $link = if ($adapter) { "$($adapter.Status)" } else { 'Missing' }
+    $dnsServer = if ($Route -and $Route.Dns) { $Route.Dns } else { $Ctx.Dns }
 
     $async = [System.Collections.Generic.List[object]]::new()
     if ($Ctx.GwPingable) { $async.Add((Start-Check 'GW' 'ping' $Ctx.Gateway)) }
     if ($Ctx.IspPingable) { $async.Add((Start-Check 'ISP' 'ping' $Ctx.IspHop)) }
     foreach ($tgt in $Cfg.RuPing) { $async.Add((Start-Check 'RU_PING' 'ping' $tgt)) }
     foreach ($tgt in $Cfg.IntlPing) { $async.Add((Start-Check 'INTL_PING' 'ping' $tgt)) }
+    if ($Ctx.HasIpv6) { foreach ($tgt in $Cfg.Ipv6Ping) { $async.Add((Start-Check 'IPV6' 'ping' $tgt)) } }
     foreach ($tgt in $Cfg.RuHttp) { $async.Add((Start-Check 'RU_HTTP' 'http' $tgt)) }
     foreach ($tgt in $Cfg.IntlHttp) { $async.Add((Start-Check 'INTL_HTTP' 'http' $tgt)) }
     foreach ($tgt in $Cfg.CfHttp) { $async.Add((Start-Check 'CF_HTTP' 'http' $tgt)) }
@@ -576,8 +871,11 @@ function Invoke-Cycle($Ctx) {
     foreach ($tgt in $Cfg.SteamHttp) { $async.Add((Start-Check 'STEAM_HTTP' 'http' $tgt)) }
     foreach ($tgt in $Ctx.SteamCm) { $async.Add((Start-Check 'STEAM_CM' 'tcp' $tgt)) }
 
-    # ждём завершения всех (максимум ~9 с), фиксируя время ответа каждой проверки
-    $waitSw = [Diagnostics.Stopwatch]::StartNew()
+    # DNS синхронный, поэтому после запуска асинхронных проверок: его таймауты не задерживают остальные
+    $checks = [System.Collections.Generic.List[object]]::new()
+    foreach ($chk in Invoke-DnsChecks $dnsServer) { $checks.Add($chk) }
+
+    # ждём завершения всех (максимум ~9 с от старта), фиксируя время ответа каждой проверки
     do {
         $pending = 0
         foreach ($chk in $async) {
@@ -586,33 +884,14 @@ function Invoke-Cycle($Ctx) {
         }
         if ($pending -eq 0) { break }
         Start-Sleep -Milliseconds 25
-    } while ($waitSw.ElapsedMilliseconds -lt 9000)
+    } while (((Get-Date) - $now).TotalMilliseconds -lt 9000)
     foreach ($chk in $async) { Complete-Check $chk; $checks.Add($chk) }
+
+    $judged = Get-Verdict -Checks $checks -Link $link -HasRoute ([bool]$Route) -IspPingable $Ctx.IspPingable -PrevUnexplained $Ctx.PrevUnexplained
+    $Ctx.PrevUnexplained = $judged.Unexplained
 
     $byCat = @{}
     foreach ($grp in $checks | Group-Object Cat) { $byCat[$grp.Name] = @($grp.Group) }
-    $noneOk = { param($cat) $byCat.ContainsKey($cat) -and -not ($byCat[$cat] | Where-Object Ok) }
-    $someOk = { param($cat) $byCat.ContainsKey($cat) -and [bool]($byCat[$cat] | Where-Object Ok) }
-
-    $verdict = $null
-    if ($link -ne 'Up' -or -not $route) { $verdict = 'LINK_DOWN' }
-    elseif (& $noneOk 'GW') { $verdict = 'LAN_ROUTER' }
-    elseif ((& $noneOk 'RU_PING') -and (& $noneOk 'INTL_PING') -and (& $noneOk 'RU_HTTP')) {
-        $verdict = if (-not $Ctx.IspPingable) { 'PROVIDER' } elseif (& $someOk 'ISP') { 'PROVIDER_UPSTREAM' } else { 'PROVIDER_EDGE' }
-    }
-    elseif ((& $noneOk 'DNS') -and (& $someOk 'RU_PING')) { $verdict = 'DNS' }
-    elseif (((& $someOk 'RU_PING') -or (& $someOk 'RU_HTTP')) -and (& $noneOk 'INTL_PING') -and (& $noneOk 'INTL_HTTP')) { $verdict = 'INTL_DOWN' }
-    else {
-        $flags = @()
-        if (& $noneOk 'CF_HTTP') { $flags += 'CF_DOWN' } elseif (& $noneOk 'CF_BIG') { $flags += 'CF_THROTTLE' }
-        if ((& $noneOk 'STEAM_HTTP') -and (& $noneOk 'STEAM_CM')) { $flags += 'STEAM_ALL' }
-        elseif (& $noneOk 'STEAM_CM') { $flags += 'STEAM_CM' }
-        elseif (& $noneOk 'STEAM_HTTP') { $flags += 'STEAM_WEB' }
-        $explained = @('CF_HTTP', 'CF_BIG', 'STEAM_HTTP', 'STEAM_CM') | Where-Object { & $noneOk $_ }
-        if ($checks | Where-Object { -not $_.Ok -and $_.Cat -notin $explained }) { $flags += 'LOSS' }
-        $verdict = if ($flags) { $flags -join '+' } else { 'OK' }
-    }
-
     $fails = ($checks | Where-Object { -not $_.Ok } | ForEach-Object {
         $short = $_.Target -replace '^https?://', '' -replace '/.*$', ''
         '{0}:{1}={2}' -f $_.Cat, $short, $_.Err
@@ -620,58 +899,101 @@ function Invoke-Cycle($Ctx) {
 
     $row = [ordered]@{
         Time  = '{0:yyyy-MM-dd HH:mm:ss}' -f $now
-        Iface = $(if ($route) { $route.Alias } else { '' })
+        Iface = $(if ($Route) { $Route.Alias } else { '' })
         Link  = $link
     }
-    foreach ($cat in 'GW', 'ISP', 'DNS', 'RU_PING', 'INTL_PING', 'RU_HTTP', 'INTL_HTTP', 'CF_HTTP', 'CF_BIG', 'STEAM_HTTP', 'STEAM_CM') {
+    foreach ($cat in 'GW', 'ISP', 'DNS', 'RU_PING', 'INTL_PING', 'RU_HTTP', 'INTL_HTTP', 'CF_HTTP', 'CF_BIG', 'STEAM_HTTP', 'STEAM_CM', 'IPV6') {
         $row[$cat] = Format-Cat $byCat[$cat]
     }
-    $row.Verdict = $verdict
+    $row.Verdict = $judged.Verdict
     $row.Fails = $fails
-    return [pscustomobject]$row
+    return [pscustomobject]@{ Row = [pscustomobject]$row; Checks = $checks.ToArray() }
 }
 
 function Save-CycleRow($Row) {
-    $csv = Join-Path $OutDir ('cycles_{0:yyyyMMdd}.csv' -f (Get-Date))
+    # файл по дате цикла (а не текущей), чтобы цикл в 23:59:59 не уехал в завтрашний файл
+    $csv = Join-Path $OutDir ('cycles_{0}.csv' -f ($Row.Time.Substring(0, 10) -replace '-', ''))
+    if (Test-Path $csv) {
+        # сменился набор колонок (новая версия скрипта): старый файл откладываем, иначе Export-Csv -Append упадёт
+        $expected = ($Row.PSObject.Properties.Name | ForEach-Object { '"{0}"' -f $_ }) -join ','
+        if ((Get-Content $csv -TotalCount 1) -ne $expected) {
+            Rename-Item $csv ('{0}_old_{1:HHmmss}.csv' -f [IO.Path]::GetFileNameWithoutExtension($csv), (Get-Date))
+        }
+    }
     $Row | Export-Csv -Path $csv -Append -NoTypeInformation -Encoding utf8
 }
 
-function Get-TraceTargets([string]$Verdict, $Ctx) {
-    $targets = @{}
+function Get-TraceTargets([string]$Verdict, $Checks, $Ctx) {
+    # цель -> причина. Для мягких флагов трассируем то, что реально не прошло, а не фиксированный 8.8.8.8
+    $targets = [ordered]@{}
     foreach ($flag in $Verdict -split '\+') {
         switch -Regex ($flag) {
             '^LAN_ROUTER$' { $targets[$Ctx.Gateway] = $flag }
             '^PROVIDER' { $targets['77.88.8.8'] = $flag }
-            '^INTL_DOWN$|^LOSS$' { $targets['8.8.8.8'] = $flag }
-            '^CF_' { $targets['speed.cloudflare.com'] = $flag }
-            '^STEAM_(CM|ALL)$' { $targets[(($Ctx.SteamCm | Select-Object -First 1) -replace ':\d+$', '')] = $flag }
-            '^STEAM_(WEB|ALL)$' { $targets['store.steampowered.com'] = $flag }
+            '^INTL_DOWN$' { $targets['8.8.8.8'] = $flag }
+            '^(CF_|STEAM_|IPV6$|LOSS$)' {
+                $cats = if ($flag -eq 'LOSS') { $null } else { $FlagCats[$flag] }
+                $hosts = @($Checks | Where-Object { -not $_.Ok -and $_.Cat -ne 'DNS' -and (-not $cats -or $_.Cat -in $cats) } |
+                    ForEach-Object { Get-CheckHost $_ } | Where-Object { $_ } | Select-Object -Unique -First $Cfg.TracesPerFlag)
+                foreach ($hostName in $hosts) { if (-not $targets.Contains($hostName)) { $targets[$hostName] = $flag } }
+            }
         }
     }
     return $targets
 }
 
-function Update-State($Ctx, $Row) {
-    if ($Row.Link -ne $Ctx.LastLink) {
-        Write-NetEvent "LINK $($Ctx.LastLink) -> $($Row.Link) (адаптер ifIndex $($Ctx.IfIndex))" 'Magenta'
-        $Ctx.LastLink = $Row.Link
+function Update-Notification($Ctx, $Row) {
+    # Уведомление, когда сбой держится N циклов подряд, и когда он закончился. Одиночный LOSS не считается
+    $isProblem = $Row.Verdict -ne 'OK' -and $Row.Verdict -ne 'LOSS'
+    if (-not $isProblem) {
+        if ($Ctx.NotifiedVerdict) {
+            $since = [datetime]::ParseExact($Ctx.BadSince, 'yyyy-MM-dd HH:mm:ss', $null)
+            $duration = [datetime]::ParseExact($Row.Time, 'yyyy-MM-dd HH:mm:ss', $null) - $since
+            Send-Notification $Ctx.Notifier 'netmon: восстановилось' ("{0} длился {1:hh\:mm\:ss}" -f $Ctx.NotifiedVerdict, $duration) 'Info'
+            Write-NetEvent "NOTIFY восстановилось после $($Ctx.NotifiedVerdict), $('{0:hh\:mm\:ss}' -f $duration)" 'DarkGray' $Row.Time
+        }
+        $Ctx.BadStreak = 0
+        $Ctx.BadSince = ''
+        $Ctx.NotifiedVerdict = ''
+        return
     }
-    $recovered = $Ctx.LastVerdict -ne 'OK' -and $Ctx.LastVerdict -ne 'START' -and $Row.Verdict -eq 'OK'
-    if ($Row.Verdict -ne $Ctx.LastVerdict) {
-        $color = if ($Row.Verdict -eq 'OK') { 'Green' } else { 'Red' }
-        Write-NetEvent "VERDICT $($Ctx.LastVerdict) -> $($Row.Verdict) | $($Row.Fails)" $color
-        if ($Row.Verdict -ne 'OK' -and $Row.Verdict -ne 'LINK_DOWN') {
-            $targets = Get-TraceTargets $Row.Verdict $Ctx
+    if ($Ctx.BadStreak -eq 0) { $Ctx.BadSince = $Row.Time }
+    $Ctx.BadStreak++
+    $isHard = ($Row.Verdict -split '\+')[0] -in $HardVerdicts
+    $threshold = if ($isHard) { $Cfg.NotifyHardAfter } else { $Cfg.NotifySoftAfter }
+    if (-not $Ctx.NotifiedVerdict -and $Ctx.BadStreak -ge $threshold) {
+        $flag = ($Row.Verdict -split '\+')[0]
+        Send-Notification $Ctx.Notifier "netmon: $($Row.Verdict)" ("с {0}: {1}" -f $Ctx.BadSince.Substring(11), $VerdictHelp[$flag]) $(if ($isHard) { 'Error' } else { 'Warning' })
+        Write-NetEvent "NOTIFY $($Row.Verdict)" 'DarkGray' $Row.Time
+        $Ctx.NotifiedVerdict = $Row.Verdict
+    }
+}
+
+function Update-State($Ctx, $Result) {
+    $row = $Result.Row
+    if ($row.Link -ne $Ctx.LastLink) {
+        Write-NetEvent "LINK $($Ctx.LastLink) -> $($row.Link) (адаптер '$($Ctx.Alias)')" 'Magenta' $row.Time
+        $Ctx.LastLink = $row.Link
+    }
+    $prevBase = ($Ctx.LastVerdict -split '\+')[0]
+    $recovered = $prevBase -in $HardVerdicts -and $row.Verdict -eq 'OK'
+    if ($row.Verdict -ne $Ctx.LastVerdict) {
+        $color = if ($row.Verdict -eq 'OK') { 'Green' } else { 'Red' }
+        Write-NetEvent "VERDICT $($Ctx.LastVerdict) -> $($row.Verdict) | $($row.Fails)" $color $row.Time
+        if ($row.Verdict -ne 'OK' -and $row.Verdict -ne 'LINK_DOWN') {
+            $targets = Get-TraceTargets $row.Verdict $Result.Checks $Ctx
             foreach ($tgt in $targets.Keys) {
                 $last = $Ctx.LastTrace[$tgt]
                 if ($last -and ((Get-Date) - $last).TotalSeconds -lt $Cfg.TraceCooldownS) { continue }
                 $Ctx.LastTrace[$tgt] = Get-Date
-                $file = Start-Trace $tgt $targets[$tgt]
-                Write-NetEvent "TRACE $tgt -> $file" 'DarkCyan'
+                $trace = Start-Trace $tgt $targets[$tgt]
+                $Ctx.TraceJobs.Add($trace.Job)
+                Write-NetEvent "TRACE $tgt -> $($trace.File)" 'DarkCyan' $row.Time
             }
         }
-        $Ctx.LastVerdict = $Row.Verdict
+        $Ctx.LastVerdict = $row.Verdict
     }
+    Update-Notification $Ctx $row
     if ($recovered -or ($Ctx.Cycle % $Cfg.PublicIpEvery -eq 0)) {
         $ip = Get-PublicIp
         if ($ip -and $ip -ne $Ctx.PublicIp) {
@@ -679,16 +1001,21 @@ function Update-State($Ctx, $Row) {
             $Ctx.PublicIp = $ip
         }
     }
-    Get-Job -State Completed -ErrorAction SilentlyContinue | Remove-Job
+    # убираем только свои завершившиеся трассировки (включая упавшие)
+    foreach ($job in @($Ctx.TraceJobs | Where-Object { $_.State -notin 'NotStarted', 'Running' })) {
+        Remove-Job $job -Force
+        $null = $Ctx.TraceJobs.Remove($job)
+    }
 }
 
 function Write-CycleLine($Row) {
-    $color = if ($Row.Verdict -eq 'OK') { 'Green' } elseif ($Row.Verdict -in $HardVerdicts) { 'Red' } else { 'Yellow' }
+    $color = if ($Row.Verdict -eq 'OK') { 'Green' } elseif (($Row.Verdict -split '\+')[0] -in $HardVerdicts) { 'Red' } else { 'Yellow' }
     $line = '{0} {1,-20} gw {2,-9} ru {3,-9} intl {4,-9} dns {5,-5} cf {6,-9} cf256k {7,-9} steam {8,-9} cm {9}' -f
         $Row.Time.Substring(11), $Row.Verdict, $Row.GW, $Row.RU_PING, $Row.INTL_PING, $Row.DNS.Split(' ')[0],
         $Row.CF_HTTP, $Row.CF_BIG, $Row.STEAM_HTTP, $Row.STEAM_CM
+    if ($Row.IPV6 -and $Row.IPV6 -ne '-') { $line += " v6 $($Row.IPV6)" }
     Write-Host $line -ForegroundColor $color
-    if ($Row.Verdict -ne 'OK' -and $Row.Fails) { Write-Host "         $($Row.Fails)" -ForegroundColor DarkGray }
+    if ($Row.Fails) { Write-Host "         $($Row.Fails)" -ForegroundColor DarkGray }
 }
 
 function Show-Status($Rows, [string]$Title) {
@@ -726,7 +1053,7 @@ function Show-Status($Rows, [string]$Title) {
 
     Write-Host "`n  Вердикты:" -ForegroundColor Cyan
     foreach ($grp in $items | Group-Object Verdict | Sort-Object Count -Descending) {
-        $color = if ($grp.Name -eq 'OK') { 'Green' } elseif ($grp.Name -in $HardVerdicts) { 'Red' } else { 'Yellow' }
+        $color = if ($grp.Name -eq 'OK') { 'Green' } elseif (($grp.Name -split '\+')[0] -in $HardVerdicts) { 'Red' } else { 'Yellow' }
         Write-Host ('    {0} - {1} из {2} циклов' -f $grp.Name, $grp.Count, $items.Count) -ForegroundColor $color
         foreach ($flag in $grp.Name -split '\+') {
             if ($flag -ne 'OK' -and $VerdictHelp.Contains($flag)) { Write-Host "        $flag`: $($VerdictHelp[$flag])" }
@@ -746,66 +1073,100 @@ function Invoke-QuickCheck([int]$Cycles = 3) {
         return
     }
     Write-Host 'Подготовка: поиск первого хопа провайдера, список серверов Steam, внешний IP...' -ForegroundColor Cyan
-    $traceLines = & tracert.exe -d -w 700 -h 6 '77.88.8.8'
     $summary = [pscustomobject]@{
-        IspHop   = Find-IspHop $traceLines $route.Gateway
+        IspHop   = Resolve-IspHop $route.Gateway
         SteamCm  = Get-SteamCmEndpoints
         PublicIp = Get-PublicIp
     }
     $ctx = Initialize-Context $summary 'CHECK'
     Write-Host 'Прогревочный цикл...'
     $null = Invoke-Cycle $ctx
+    $ctx.PrevUnexplained = @()
     $rows = foreach ($num in 1..$Cycles) {
-        $row = Invoke-Cycle $ctx
-        Save-CycleRow $row
-        Write-CycleLine $row
-        $row
+        $result = Invoke-Cycle $ctx
+        Save-CycleRow $result.Row
+        Write-CycleLine $result.Row
+        $result.Row
         if ($num -lt $Cycles) { Start-Sleep -Seconds 5 }
     }
     Show-Status $rows 'Итог быстрой проверки'
 }
 
 function Start-Monitor([int]$Minutes = 0) {
+    $lock = Enter-MonitorLock
+    if (-not $lock) {
+        Write-Host "Мониторинг для $OutDir уже запущен в другом окне (автозапуск?). Второй экземпляр не стартует." -ForegroundColor Yellow
+        Write-Host 'Посмотреть, что он насобирал: пункт 6 (отчёт).'
+        return
+    }
     $startTime = Get-Date
     $canReadKeys = -not [Console]::IsInputRedirected
-    Invoke-Cleanup $Retention
-    # при автозапуске сеть может ещё не подняться: ждём маршрут по умолчанию
-    if (-not (Get-ActiveRoute)) {
-        Write-Host 'Нет сети (маршрута по умолчанию), жду подключения... (Q - выход)' -ForegroundColor Yellow
-        Write-NetEvent 'WAIT нет маршрута по умолчанию при старте' 'Yellow'
-        while (-not (Get-ActiveRoute)) {
-            if (Wait-OrQuit 10000 $canReadKeys) { return }
-        }
-        Start-Sleep -Seconds 5
-    }
-    $summary = Save-Snapshot
-    $ctx = Initialize-Context $summary
-    Write-Host 'Прогревочный цикл (не пишется в лог: первый запуск HttpClient/TLS даёт ложные таймауты)...'
-    $null = Invoke-Cycle $ctx
-    $limitText = if ($Minutes) { "$Minutes мин" } else { 'до остановки' }
-    Write-Host "Мониторинг каждые $IntervalSec с ($limitText), Cloudflare 256 КБ - раз в $CfBigStep цикл(ов). Данные: $OutDir" -ForegroundColor Cyan
-    Write-Host 'Остановить: Q, Esc или Ctrl+C - в конце будет итоговый отчёт' -ForegroundColor Cyan
-
-    $sessionRows = [System.Collections.Generic.List[object]]::new()
-    $monitorStart = Get-Date
-    $cleanupDay = (Get-Date).Date
-    if ($canReadKeys) { [Console]::TreatControlCAsInput = $true }
+    $snapshot = $null
+    $ctx = $null
     try {
+        Invoke-Cleanup $Retention
+        # при автозапуске сеть может ещё не подняться: ждём маршрут по умолчанию
+        if (-not (Get-ActiveRoute)) {
+            Write-Host 'Нет сети (маршрута по умолчанию), жду подключения... (Q - выход)' -ForegroundColor Yellow
+            Write-NetEvent 'WAIT нет маршрута по умолчанию при старте' 'Yellow'
+            while (-not (Get-ActiveRoute)) {
+                if (Wait-OrQuit 10000 $canReadKeys) { return }
+            }
+            Start-Sleep -Seconds 5
+        }
+        # снапшот дописывается в фоне, мониторинг стартует сразу
+        $snapshot = Start-Snapshot
+        $route = Get-ActiveRoute
+        $summary = [pscustomobject]@{ IspHop = Resolve-IspHop $route.Gateway; SteamCm = $snapshot.SteamCm; PublicIp = Get-PublicIp }
+        $snapshot.PublicIp = $summary.PublicIp
+        $ctx = Initialize-Context $summary
+        $ctx.Notifier = New-Notifier
+        Write-Host 'Прогревочный цикл (не пишется в лог: первый запуск HttpClient/TLS даёт ложные таймауты)...'
+        $null = Invoke-Cycle $ctx
+        $ctx.PrevUnexplained = @()
+        $limitText = if ($Minutes) { "$Minutes мин" } else { 'до остановки' }
+        Write-Host "Мониторинг каждые $IntervalSec с ($limitText), Cloudflare 256 КБ - раз в $CfBigStep цикл(ов). Данные: $OutDir" -ForegroundColor Cyan
+        Write-Host 'Остановить: Q, Esc или Ctrl+C - в конце будет итоговый отчёт' -ForegroundColor Cyan
+
+        $sessionRows = [System.Collections.Generic.List[object]]::new()
+        $monitorStart = Get-Date
+        $dailyDay = (Get-Date).Date
+        if ($canReadKeys) { [Console]::TreatControlCAsInput = $true }
         while ($true) {
             $loopSw = [Diagnostics.Stopwatch]::StartNew()
-            if ((Get-Date).Date -ne $cleanupDay) { Invoke-Cleanup $Retention; $cleanupDay = (Get-Date).Date }
+            if ((Get-Date).Date -ne $dailyDay) {
+                # раз в сутки: чистка и свежий список CM (Steam перераспределяет нагрузку)
+                Invoke-Cleanup $Retention
+                $freshCm = @(Get-SteamCmEndpoints)
+                if (($freshCm -join ',') -ne ($ctx.SteamCm -join ',')) {
+                    Write-NetEvent "STEAM_CM список обновлён: $($freshCm -join ',')" 'DarkGray'
+                    $ctx.SteamCm = $freshCm
+                }
+                $dailyDay = (Get-Date).Date
+            }
+            $route = Get-ActiveRoute
+            if (Test-RouteChanged $ctx $route) { $ctx = Update-Context $ctx $route }
             $ctx.Cycle++
-            $row = Invoke-Cycle $ctx
-            Save-CycleRow $row
-            $sessionRows.Add($row)
-            Write-CycleLine $row
-            Update-State $ctx $row
+            if ($ctx.Cycle % $Cfg.ReprobeEvery -eq 0) { Update-Reachability $ctx }
+            $result = Invoke-Cycle $ctx $route
+            Save-CycleRow $result.Row
+            $sessionRows.Add($result.Row)
+            Write-CycleLine $result.Row
+            Update-State $ctx $result
+            if ($snapshot -and (Complete-Snapshot $snapshot)) {
+                Write-NetEvent "SNAPSHOT готов: $($snapshot.Dir)" 'DarkGray'
+                $snapshot = $null
+            }
             if ($Minutes -and ((Get-Date) - $monitorStart).TotalMinutes -ge $Minutes) { break }
             if (Wait-OrQuit ($IntervalSec * 1000 - $loopSw.ElapsedMilliseconds) $canReadKeys) { break }
         }
     } finally {
         if ($canReadKeys) { [Console]::TreatControlCAsInput = $false }
-        Write-NetEvent 'STOP' 'Cyan'
+        if ($snapshot) { Stop-Snapshot $snapshot }
+        if ($ctx -and $ctx.Notifier) { $ctx.Notifier.Visible = $false; $ctx.Notifier.Dispose() }
+        if ($ctx) { Write-NetEvent 'STOP' 'Cyan' }
+        $lock.ReleaseMutex()
+        $lock.Dispose()
     }
     Show-Report $startTime -Brief
     Show-Status $sessionRows 'Итог за сеанс мониторинга'
@@ -814,23 +1175,16 @@ function Start-Monitor([int]$Minutes = 0) {
 # ----------------------------------------------------------------------------------------------------------------
 # Report
 # ----------------------------------------------------------------------------------------------------------------
-function Show-Report([datetime]$From, [switch]$Brief) {
-    $rows = @(Get-ChildItem $OutDir -Filter 'cycles_*.csv' | Sort-Object Name | ForEach-Object { Import-Csv $_.FullName } |
-        ForEach-Object { $_ | Add-Member -NotePropertyName Ts -NotePropertyValue ([datetime]::ParseExact($_.Time, 'yyyy-MM-dd HH:mm:ss', $null)) -PassThru } |
-        Where-Object { $_.Ts -ge $From } | Sort-Object Ts)
-    if (-not $rows.Count) { Write-Host "Нет данных мониторинга с $From в $OutDir"; return }
-
-    $gapSec = [Math]::Max(60, $IntervalSec * 4)
+function Get-Incidents($Rows, [int]$GapSec) {
+    # Rows: отсортированные по Ts строки CSV. Подряд идущие одинаковые не-OK вердикты = один инцидент
     $incidents = [System.Collections.Generic.List[object]]::new()
     $current = $null
     $prevTs = $null
-    $stats = @{}
-    foreach ($row in $rows) {
-        if ($prevTs -and ($row.Ts - $prevTs).TotalSeconds -gt $gapSec) {
-            if ($current) { $incidents.Add($current); $current = $null }
+    foreach ($row in $Rows) {
+        if ($prevTs -and ($row.Ts - $prevTs).TotalSeconds -gt $GapSec) {
+            if ($current) { $current.End = $prevTs; $incidents.Add($current); $current = $null }
             $incidents.Add([pscustomobject]@{ Start = $prevTs; End = $row.Ts; Verdict = 'NO_DATA'; Cycles = 0; Sample = '' })
         }
-        $stats[$row.Verdict] = 1 + [int]$stats[$row.Verdict]
         if ($row.Verdict -eq 'OK') {
             if ($current) { $current.End = $row.Ts; $incidents.Add($current); $current = $null }
         } elseif ($current -and $current.Verdict -eq $row.Verdict) {
@@ -842,6 +1196,18 @@ function Show-Report([datetime]$From, [switch]$Brief) {
         $prevTs = $row.Ts
     }
     if ($current) { $current.End = $prevTs; $incidents.Add($current) }
+    return , $incidents.ToArray()
+}
+
+function Show-Report([datetime]$From, [switch]$Brief) {
+    $rows = @(Get-ChildItem $OutDir -Filter 'cycles_*.csv' | Sort-Object Name | ForEach-Object { Import-Csv $_.FullName } |
+        ForEach-Object { $_ | Add-Member -NotePropertyName Ts -NotePropertyValue ([datetime]::ParseExact($_.Time, 'yyyy-MM-dd HH:mm:ss', $null)) -PassThru } |
+        Where-Object { $_.Ts -ge $From } | Sort-Object Ts)
+    if (-not $rows.Count) { Write-Host "Нет данных мониторинга с $From в $OutDir"; return }
+
+    $incidents = Get-Incidents $rows ([Math]::Max(60, $IntervalSec * 4))
+    $stats = @{}
+    foreach ($row in $rows) { $stats[$row.Verdict] = 1 + [int]$stats[$row.Verdict] }
 
     Write-Host ("`nПериод: {0:yyyy-MM-dd HH:mm} .. {1:yyyy-MM-dd HH:mm}, циклов: {2}" -f $rows[0].Ts, $rows[-1].Ts, $rows.Count) -ForegroundColor Cyan
     Write-Host "`nРаспределение вердиктов:" -ForegroundColor Cyan
@@ -849,19 +1215,22 @@ function Show-Report([datetime]$From, [switch]$Brief) {
         '  {0,-28} {1,6} циклов  {2,6:P1}' -f $_.Key, $_.Value, ($_.Value / $rows.Count)
     } | Write-Host
 
-    Write-Host "`nИнциденты (последние 60):" -ForegroundColor Cyan
-    if (-not $incidents.Count) { Write-Host '  нет' -ForegroundColor Green }
-    $incidents | Select-Object -Last 60 | ForEach-Object {
+    $shown = @($incidents | Where-Object { -not ($_.Verdict -eq 'LOSS' -and $_.Cycles -lt $Cfg.ReportMinLoss) })
+    $hidden = $incidents.Count - $shown.Count
+    $hiddenText = if ($hidden) { ", скрыто коротких LOSS (< $($Cfg.ReportMinLoss) циклов): $hidden" } else { '' }
+    Write-Host "`nИнциденты (последние 60$hiddenText):" -ForegroundColor Cyan
+    if (-not $shown.Count) { Write-Host '  нет' -ForegroundColor Green }
+    $shown | Select-Object -Last 60 | ForEach-Object {
         $dur = $_.End - $_.Start
-        $color = if ($_.Verdict -eq 'NO_DATA') { 'DarkGray' } elseif ($_.Verdict -in $HardVerdicts) { 'Red' } else { 'Yellow' }
-        Write-Host ('  {0:MM-dd HH:mm:ss} - {1:HH:mm:ss}  {2,8}  {3,-24} {4}' -f $_.Start, $_.End, $dur.ToString('hh\:mm\:ss'), $_.Verdict, $_.Sample) -ForegroundColor $color
+        $color = if ($_.Verdict -eq 'NO_DATA') { 'DarkGray' } elseif (($_.Verdict -split '\+')[0] -in $HardVerdicts) { 'Red' } else { 'Yellow' }
+        Write-Host ('  {0:MM-dd HH:mm:ss} - {1:HH:mm:ss}  {2,10}  {3,-24} {4}' -f $_.Start, $_.End, $dur.ToString('d\.hh\:mm\:ss'), $_.Verdict, $_.Sample) -ForegroundColor $color
     }
 
-    Write-Host "`nСобытия монитора (линк, внешний IP, старт/стоп):" -ForegroundColor Cyan
+    Write-Host "`nСобытия монитора (линк, маршрут, внешний IP, старт/стоп):" -ForegroundColor Cyan
     if (Test-Path $EventsFile) {
         Get-Content $EventsFile | Where-Object {
             $_ -match '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)' -and [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', $null) -ge $From -and
-            $_ -match '^\S+ \S+ (LINK|PUBLIC_IP|START|CHECK|STOP)\b'
+            $_ -match '^\S+ \S+ (LINK|ROUTE_CHANGE|ROUTE|PUBLIC_IP|START|CHECK|STOP|WAIT|PROBE)\b'
         } | ForEach-Object { "  $_" } | Write-Host
     }
 
@@ -880,6 +1249,23 @@ function Show-Report([datetime]$From, [switch]$Brief) {
     }
 }
 
+function Save-Report([datetime]$From, [string]$Path = '') {
+    # Отчёт и на экран, и в текстовый файл (для провайдера). Write-Host попадает в transcript
+    if (-not $Path) { $Path = Join-Path $ReportsDir ('report_{0:yyyyMMdd_HHmmss}.txt' -f (Get-Date)) }
+    $Path = [IO.Path]::GetFullPath($Path)
+    New-Item -ItemType Directory -Force -Path (Split-Path $Path) | Out-Null
+    $tmp = [IO.Path]::GetTempFileName()
+    Start-Transcript -Path $tmp -UseMinimalHeader -Force | Out-Null
+    try { Show-Report $From } finally { Stop-Transcript | Out-Null }
+    $lines = @(Get-Content $tmp)
+    Remove-Item $tmp -Force
+    # transcript обрамляет вывод блоками из звёздочек: шапка (2 линии) и подвал (2 линии)
+    $marks = @(for ($idx = 0; $idx -lt $lines.Count; $idx++) { if ($lines[$idx] -match '^\*{10,}$') { $idx } })
+    $body = if ($marks.Count -ge 3 -and $marks[2] - $marks[1] -gt 1) { $lines[($marks[1] + 1)..($marks[2] - 1)] } else { $lines }
+    Set-Content -Path $Path -Value $body -Encoding utf8BOM
+    Write-Host "`nОтчёт сохранён: $Path" -ForegroundColor Green
+}
+
 # ----------------------------------------------------------------------------------------------------------------
 # Menu
 # ----------------------------------------------------------------------------------------------------------------
@@ -892,7 +1278,7 @@ function Show-Menu {
         Write-Host '  3  Снапшот + pathping: потери на каждом хопе (~5-7 мин)'
         Write-Host '  4  Мониторинг до остановки (Q / Esc / Ctrl+C), в конце отчёт'
         Write-Host '  5  Мониторинг на N минут, в конце отчёт'
-        Write-Host '  6  Отчёт за последние N часов'
+        Write-Host '  6  Отчёт за последние N часов (+ сохраняется в data\reports)'
         Write-Host '  7  Сравнить маршруты двух последних снапшотов'
         Write-Host '  8  Открыть папку с данными'
         $autostartText = if (Get-AutostartState) { 'ВКЛЮЧЁН - выбрать, чтобы выключить' } else { 'выключен - выбрать, чтобы включить' }
@@ -908,7 +1294,7 @@ function Show-Menu {
                 '3' { $null = Save-Snapshot -WithPathping }
                 '4' { Start-Monitor 0 }
                 '5' { Start-Monitor (Read-Number 'Сколько минут мониторить' 30) }
-                '6' { Show-Report (Get-Date).AddHours(-(Read-Number 'За сколько последних часов' 24)) }
+                '6' { Save-Report (Get-Date).AddHours(-(Read-Number 'За сколько последних часов' 24)) }
                 '7' { Compare-Snapshots }
                 '8' { Invoke-Item $OutDir }
                 '9' { if (Get-AutostartState) { Disable-Autostart } else { Enable-Autostart } }
@@ -924,6 +1310,9 @@ function Show-Menu {
     }
 }
 
+# Подключение через dot-source (тесты: . .\netmon.ps1 -OutDir ...) - только определения функций, без запуска
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 $failed = $false
 try {
     switch ($Mode) {
@@ -931,7 +1320,10 @@ try {
         'Check' { Invoke-QuickCheck 3 }
         'Snapshot' { $null = Save-Snapshot -WithPathping:$Deep }
         'Diff' { Compare-Snapshots }
-        'Report' { Show-Report $(if ($Hours -gt 0) { (Get-Date).AddHours(-$Hours) } else { $Since }) }
+        'Report' {
+            $from = if ($Hours -gt 0) { (Get-Date).AddHours(-$Hours) } else { $Since }
+            if ($Out) { Save-Report $from $Out } else { Show-Report $from }
+        }
         'Monitor' { Start-Monitor $DurationMin }
         'AutostartOn' { Enable-Autostart }
         'AutostartOff' { Disable-Autostart }
